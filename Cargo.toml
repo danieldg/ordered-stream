@@ -1,0 +1,14 @@
+[package]
+name = "futures-join-stream"
+version = "0.0.1"
+authors = ["Daniel De Graaf <code@danieldg.net>"]
+license = "MIT OR Apache-2.0"
+edition = "2018"
+
+description = "Efficient sorted joining of continuous sorted async Streams"
+repository = "https://github.com/danieldg/futures-join-stream"
+keywords = ["async"]
+
+[dependencies]
+futures-core = "0.3"
+pin-project-lite = "0.2"

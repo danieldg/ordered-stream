@@ -97,6 +97,29 @@ impl<I, T> JoinableStreamResult<I, T> {
     }
 }
 
+impl<I, E, T> JoinableStreamResult<Result<I, E>, T> {
+    /// Extract the error of a [`Result`] item.
+    pub fn transpose_result(self) -> Result<JoinableStreamResult<I, T>, E> {
+        self.transpose_result_token().map_err(|(e, _)| e)
+    }
+
+    /// Extract the error and token from a [`Result`] item.
+    pub fn transpose_result_token(self) -> Result<JoinableStreamResult<I, T>, (E, T)> {
+        match self {
+            Self::Item {
+                item: Ok(item),
+                token,
+            } => Ok(JoinableStreamResult::Item { item, token }),
+            Self::Item {
+                item: Err(item),
+                token,
+            } => Err((item, token)),
+            Self::NoneBefore => Ok(JoinableStreamResult::NoneBefore),
+            Self::Terminated => Ok(JoinableStreamResult::Terminated),
+        }
+    }
+}
+
 pin_project_lite::pin_project! {
     /// A stream for the [`into_blocking_joinable`] function.
     #[derive(Debug)]
@@ -298,6 +321,7 @@ where
     }
 }
 
+/// A helper equivalent to Poll<JoinableStreamResult<I, T>> but easier to match
 enum PollState<I, T> {
     Item(I, T),
     Pending,
@@ -349,32 +373,29 @@ impl<I, T: Ord> PollState<I, T> {
             (None, None) => None,
         };
 
-        match run(token) {
-            Poll::Ready(JoinableStreamResult::Item { item, token }) => {
-                *self = Self::Item(item, token);
-                true
-            }
-            Poll::Ready(JoinableStreamResult::NoneBefore) => {
-                *self = Self::NoneBefore;
-                false
-            }
-            Poll::Ready(JoinableStreamResult::Terminated) => {
-                *self = Self::Terminated;
-                false
-            }
-            Poll::Pending => {
-                *self = Self::Pending;
-                false
-            }
+        *self = run(token).into();
+        matches!(self, Self::Item { .. })
+    }
+}
+
+impl<I, T> From<PollState<I, T>> for Poll<JoinableStreamResult<I, T>> {
+    fn from(poll: PollState<I, T>) -> Self {
+        match poll {
+            PollState::Item(item, token) => Poll::Ready(JoinableStreamResult::Item { item, token }),
+            PollState::Pending => Poll::Pending,
+            PollState::NoneBefore => Poll::Ready(JoinableStreamResult::NoneBefore),
+            PollState::Terminated => Poll::Ready(JoinableStreamResult::Terminated),
         }
     }
+}
 
-    fn into_poll(self) -> Poll<JoinableStreamResult<I, T>> {
-        match self {
-            Self::Item(item, token) => Poll::Ready(JoinableStreamResult::Item { item, token }),
-            Self::Pending => Poll::Pending,
-            Self::NoneBefore => Poll::Ready(JoinableStreamResult::NoneBefore),
-            Self::Terminated => Poll::Ready(JoinableStreamResult::Terminated),
+impl<I, T> From<Poll<JoinableStreamResult<I, T>>> for PollState<I, T> {
+    fn from(poll: Poll<JoinableStreamResult<I, T>>) -> Self {
+        match poll {
+            Poll::Ready(JoinableStreamResult::Item { item, token }) => Self::Item(item, token),
+            Poll::Ready(JoinableStreamResult::NoneBefore) => Self::NoneBefore,
+            Poll::Ready(JoinableStreamResult::Terminated) => Self::Terminated,
+            Poll::Pending => Self::Pending,
         }
     }
 }
@@ -429,11 +450,11 @@ where
             // If one side is terminated, we can produce items directly from the other side.
             (a, PollState::Terminated) => {
                 *this.state = JoinState::OnlyPollA;
-                a.into_poll()
+                a.into()
             }
             (PollState::Terminated, b) => {
                 *this.state = JoinState::OnlyPollB;
-                b.into_poll()
+                b.into()
             }
 
             // If one side is pending, we can't return Ready until that gets resolved.  Because we
@@ -621,22 +642,14 @@ where
     ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>> {
         let mut this = self.project();
         loop {
-            match this.stream.as_mut().poll_next_before(cx, before) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(JoinableStreamResult::Terminated) => {
-                    return Poll::Ready(JoinableStreamResult::Terminated)
-                }
-                Poll::Ready(JoinableStreamResult::NoneBefore) => {
-                    return Poll::Ready(JoinableStreamResult::NoneBefore)
-                }
-                Poll::Ready(JoinableStreamResult::Item { item, token }) => {
-                    match (this.filter)(item) {
-                        Some(item) => {
-                            return Poll::Ready(JoinableStreamResult::Item { item, token })
-                        }
-                        None => continue,
-                    }
-                }
+            match this.stream.as_mut().poll_next_before(cx, before).into() {
+                PollState::Pending => return Poll::Pending,
+                PollState::Terminated => return Poll::Ready(JoinableStreamResult::Terminated),
+                PollState::NoneBefore => return Poll::Ready(JoinableStreamResult::NoneBefore),
+                PollState::Item(item, token) => match (this.filter)(item) {
+                    Some(item) => return Poll::Ready(JoinableStreamResult::Item { item, token }),
+                    None => continue,
+                },
             }
         }
     }
@@ -708,33 +721,28 @@ where
         let mut this = self.project();
         loop {
             if let ThenProj::Running { future, token } = this.future.as_mut().project() {
-                // First try to make progress on the future, as we are likely to need it eventually
+                // Because we know the next token, we can answer questions about it now.
+                if let Some(before) = before {
+                    if *token >= *before {
+                        return Poll::Ready(JoinableStreamResult::NoneBefore);
+                    }
+                }
+
                 if let Poll::Ready(item) = future.poll(cx) {
                     if let ThenDone::Running { token, .. } =
                         this.future.as_mut().project_replace(ThenItem::Idle)
                     {
                         return Poll::Ready(JoinableStreamResult::Item { item, token });
                     }
-                } else if let Some(before) = before {
-                    // Don't return Pending if asked about a point that we know is past.
-                    if *token < *before {
-                        return Poll::Pending;
-                    } else {
-                        return Poll::Ready(JoinableStreamResult::NoneBefore);
-                    }
                 } else {
                     return Poll::Pending;
                 }
             }
-            match this.stream.as_mut().poll_next_before(cx, before) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(JoinableStreamResult::Terminated) => {
-                    return Poll::Ready(JoinableStreamResult::Terminated)
-                }
-                Poll::Ready(JoinableStreamResult::NoneBefore) => {
-                    return Poll::Ready(JoinableStreamResult::NoneBefore)
-                }
-                Poll::Ready(JoinableStreamResult::Item { item, token }) => {
+            match this.stream.as_mut().poll_next_before(cx, before).into() {
+                PollState::Pending => return Poll::Pending,
+                PollState::Terminated => return Poll::Ready(JoinableStreamResult::Terminated),
+                PollState::NoneBefore => return Poll::Ready(JoinableStreamResult::NoneBefore),
+                PollState::Item(item, token) => {
                     this.future.set(ThenItem::Running {
                         future: (this.then)(item),
                         token,

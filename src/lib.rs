@@ -1,35 +1,46 @@
 #![no_std]
-use core::future::Future;
-use core::mem;
+//! Streams that produce elements with an associated ordering.
+//!
+//! Say you have a bunch of events that all have a timestamp, sequence number, or other ordering
+//! attribute.  If you get these events from multiple [`Stream`](core::stream::Stream)s, then you
+//! should be able to produce a "composite" stream by joining each of the individual streams, so
+//! long as each originating stream is ordered.
+//!
+//! However, if you actually implement this, you discover that you need to buffer at least one
+//! element from each stream in order to avoid ordering inversions if the sources are independent
+//! (including just running in different tasks).  This presents a problem if one of the sources
+//! rarely produces events: that slow source can stall all other streams in order to handle the
+//! case where the slowness is due to an earlier element instead of just having no elements.
+//!
+//! The [`OrderedStream`] trait provides a way to solve this problem: if you can ask a stream if it
+//! will ever have any events that should be delivered before a given event, then you can often
+//! avoid blocking the composite stream when data is ready.
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use futures_core::{FusedStream, Stream};
 
-/// A stream that can be joined with other streams while preserving a element ordering.
+/// A stream that produces items that are ordered according to some token.
 ///
-/// Say you have a bunch of events that all have a timestamp, sequence number, or other ordering
-/// attribute.  Also assume you are getting these events from multiple [`Stream`]s.  If each stream
-/// is ordered, it should be possible to produce a "composite" stream by joining each of the
-/// individual streams.
-///
-/// However, if you actually implement this, you discover that you need to buffer at least one
-/// element from each stream in order to avoid ordering inversions if the sources are independent
-/// (including just running in different tasks).  This presents a problem if one of the sources
-/// rarely produces events: that slow source can stall all other streams in order to handle the
-/// case where the slowness is due to an earlier element instead of just having no elements.
-///
-/// This trait provides a way to solve this problem: if you can ask a stream if it will ever have
-/// any events older than a certain value, then you can avoid blocking the composite stream.
-pub trait JoinableStream: Stream {
-    type OrderingToken: Ord;
+/// The main advantage of this trait over the standard `Stream` trait is the ability to implement a
+/// [`join`](join()) function that does not either block until both source streams produce an item
+/// or contain a race condition when rejoining streams that originated from a common well-ordered
+/// source.
+pub trait OrderedStream {
+    /// The type ordered by this stream.
+    ///
+    /// Each stream must produce values that are in ascending order according to this function,
+    /// although there is no requirement that the values be strictly ascending.
+    type Ordering: Ord;
+
+    /// The unordered data carried by this stream
+    ///
+    /// This is split from the `Ordering` type to allow specifying a smaller or cheaper-to-generate
+    /// type as the ordering key.  This is especially useful if you generate values to pass in to
+    /// `before`.
+    type Data;
 
     /// Attempt to pull out the next value of this stream, registering the current task for wakeup
-    /// if needed, and returning `None` if it is known that the stream will not produce any more
-    /// values ordered before the given token.
-    ///
-    /// Calls to [`Stream::poll_next`] are equivalent to calls to `poll_next_before` specifying
-    /// `None` as the value of `before`.  In particular, the termination state of the stream is
-    /// shared between these two traits.
+    /// if needed, and returning `NoneBefore` if it is known that the stream will not produce any
+    /// more values ordered before the given point.
     ///
     /// # Return value
     ///
@@ -42,713 +53,162 @@ pub trait JoinableStream: Stream {
     ///
     /// - If `before` was `Some`, `Poll::Pending` means that this stream's next value is not ready
     /// and that it is not yet known if the stream will produce a value ordered prior to the given
-    /// ordering token.  Implementations will ensure that the current task is notified when either
+    /// ordering value.  Implementations will ensure that the current task is notified when either
     /// the next value is ready or once it is known that no such value will be produced.
     ///
-    /// - `Poll::Ready(JoinableStreamResult::Item)` means that the stream has successfully produced
-    /// an item and associated ordering token.  The stream may produce further values on subsequent
-    /// `poll_next_token` calls.  The returned ordering token **may** be greater than the value
-    /// passed to `before`.
+    /// - `Poll::Ready(PollResult::Item)` means that the stream has successfully produced
+    /// an item.  The stream may produce further values on subsequent `poll_next_before` calls.
+    /// The returned ordering value must not be less than any prior ordering value returned by this
+    /// stream.  The returned ordering value **may** be greater than the value passed to `before`.
     ///
-    /// - `Poll::Ready(JoinableStreamResult::Terminated)` means that the stream has terminated, and
-    /// `poll_next_token` or `poll_next` should not be invoked again.
+    /// - `Poll::Ready(PollResult::Terminated)` means that the stream has terminated, and
+    /// `poll_next_before` should not be invoked again.
     ///
-    /// - `Poll::Ready(JoinableStreamResult::NoneBefore)` means that the stream will not produce
-    /// any further ordering tokens less than the given token.  Subsequent `poll_next_token` calls
+    /// - `Poll::Ready(PollResult::NoneBefore)` means that the stream will not produce
+    /// any further ordering tokens less than the given token.  Subsequent `poll_next_before` calls
     /// may still produce additional items, but their tokens will be greater than or equal to the
     /// given token.  It does not make sense to return this value if `before` was `None`.
     fn poll_next_before(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        before: Option<&Self::OrderingToken>,
-    ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>>;
+        before: Option<&Self::Ordering>,
+    ) -> Poll<PollResult<Self::Ordering, Self::Data>>;
 }
 
-/// The result of a [`JoinableStream::poll_next_before`] operation.
+impl<P> OrderedStream for Pin<P>
+where
+    P: core::ops::DerefMut + Unpin,
+    P::Target: OrderedStream,
+{
+    type Data = <P::Target as OrderedStream>::Data;
+    type Ordering = <P::Target as OrderedStream>::Ordering;
+
+    fn poll_next_before(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        before: Option<&Self::Ordering>,
+    ) -> Poll<PollResult<Self::Ordering, Self::Data>> {
+        self.get_mut().as_mut().poll_next_before(cx, before)
+    }
+}
+
+/// An [`OrderedStream`] that tracks if the underlying stream should be polled.
+pub trait FusedOrderedStream: OrderedStream {
+    /// Returns `true` if the stream should no longer be polled.
+    fn is_terminated(&self) -> bool;
+}
+
+/// The result of a [`OrderedStream::poll_next_before`] operation.
 #[derive(Debug)]
-pub enum JoinableStreamResult<Item, Token> {
+pub enum PollResult<Ordering, Data> {
     /// An item with a corresponding ordering token.
-    Item { item: Item, token: Token },
+    Item { data: Data, ordering: Ordering },
     /// This stream will not return any items prior to the given point.
     NoneBefore,
     /// This stream is terminated and should not be polled again.
     Terminated,
 }
 
-impl<I, T> JoinableStreamResult<I, T> {
+impl<D, T> PollResult<T, D> {
+    /// Extract the data from the result.
+    pub fn into_data(self) -> Option<D> {
+        match self {
+            Self::Item { data, .. } => Some(data),
+            _ => None,
+        }
+    }
+
     /// Extract the item from the result.
-    pub fn into_item(self) -> Option<I> {
+    pub fn into_tuple(self) -> Option<(T, D)> {
         match self {
-            Self::Item { item, .. } => Some(item),
+            Self::Item { data, ordering } => Some((ordering, data)),
             _ => None,
         }
     }
 
-    /// Apply a closure to the item.
-    pub fn map_item<R>(self, f: impl FnOnce(I) -> R) -> JoinableStreamResult<R, T> {
+    /// Apply a closure to the data.
+    pub fn map_data<R>(self, f: impl FnOnce(D) -> R) -> PollResult<T, R> {
         match self {
-            Self::Item { item, token } => JoinableStreamResult::Item {
-                item: f(item),
-                token,
+            Self::Item { data, ordering } => PollResult::Item {
+                data: f(data),
+                ordering,
             },
-            Self::NoneBefore => JoinableStreamResult::NoneBefore,
-            Self::Terminated => JoinableStreamResult::Terminated,
+            Self::NoneBefore => PollResult::NoneBefore,
+            Self::Terminated => PollResult::Terminated,
         }
     }
 }
 
-impl<I, E, T> JoinableStreamResult<Result<I, E>, T> {
+impl<T, D, E> PollResult<T, Result<D, E>> {
     /// Extract the error of a [`Result`] item.
-    pub fn transpose_result(self) -> Result<JoinableStreamResult<I, T>, E> {
-        self.transpose_result_token().map_err(|(e, _)| e)
+    pub fn transpose_result(self) -> Result<PollResult<T, D>, E> {
+        self.transpose_result_item().map_err(|(_, e)| e)
     }
 
-    /// Extract the error and token from a [`Result`] item.
-    pub fn transpose_result_token(self) -> Result<JoinableStreamResult<I, T>, (E, T)> {
+    /// Extract the error and ordering from a [`Result`] item.
+    pub fn transpose_result_item(self) -> Result<PollResult<T, D>, (T, E)> {
         match self {
             Self::Item {
-                item: Ok(item),
-                token,
-            } => Ok(JoinableStreamResult::Item { item, token }),
+                data: Ok(data),
+                ordering,
+            } => Ok(PollResult::Item { data, ordering }),
             Self::Item {
-                item: Err(item),
-                token,
-            } => Err((item, token)),
-            Self::NoneBefore => Ok(JoinableStreamResult::NoneBefore),
-            Self::Terminated => Ok(JoinableStreamResult::Terminated),
+                data: Err(data),
+                ordering,
+            } => Err((ordering, data)),
+            Self::NoneBefore => Ok(PollResult::NoneBefore),
+            Self::Terminated => Ok(PollResult::Terminated),
         }
     }
 }
 
-pin_project_lite::pin_project! {
-    /// A stream for the [`into_blocking_joinable`] function.
-    #[derive(Debug)]
-    pub struct IntoBlockingJoinable<S, F> {
-        #[pin]
-        stream: S,
-        get_token: F,
-    }
-}
-
-/// Convert a [`Stream`] into a [`JoinableStream`] without using any future or past knowledge of
-/// elements.
+/// A [`Future`](core::future::Future) that produces an item with an associated ordering.
 ///
-/// This is suitable if the stream rarely or never blocks.  In general, prefer using
-/// [`into_joinable`] as it will return [`JoinableStreamResult::NoneBefore`] when possible.
-pub fn into_blocking_joinable<S, F, T>(stream: S, get_token: F) -> IntoBlockingJoinable<S, F>
-where
-    S: Stream,
-    F: FnMut(&S::Item) -> T,
-    T: Ord,
-{
-    IntoBlockingJoinable { stream, get_token }
-}
+/// This is equivalent to an [`OrderedStream`] that always produces exactly one item.  This trait
+/// is not very useful on its own; see [`FromFuture`] to convert it to a stream.
+///
+/// It is valid to implement both [`Future`](core::future::Future) and [`OrderedFuture`] on the
+/// same type.  In this case, unless otherwise documented by the implementing type, neither poll
+/// function should be invoked after either returns an output value.
+pub trait OrderedFuture {
+    /// See [`OrderedStream::Ordering`].
+    type Ordering: Ord;
 
-impl<S, F> Stream for IntoBlockingJoinable<S, F>
-where
-    S: Stream,
-{
-    type Item = S::Item;
+    /// See [`OrderedStream::Data`].
+    type Output;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
-        self.project().stream.poll_next(cx)
-    }
-}
-
-impl<S, F, T> JoinableStream for IntoBlockingJoinable<S, F>
-where
-    S: Stream,
-    F: FnMut(&S::Item) -> T,
-    T: Ord,
-{
-    type OrderingToken = T;
-
-    fn poll_next_before(
+    /// Attempt to pull out the value of this future, registering the current task for wakeup if
+    /// needed, and returning `None` if it is known that the future will not produce a value
+    /// ordered before the given point.
+    ///
+    /// # Return value
+    ///
+    /// There are several possible return values, each indicating a distinct state depending on the
+    /// value passed in `before`:
+    ///
+    /// - If `before` was `None`, `Poll::Pending` means that this future's value is not ready yet.
+    /// Implementations will ensure that the current task is notified when the next value may be
+    /// ready.
+    ///
+    /// - If `before` was `Some`, `Poll::Pending` means that this future's value is not ready and
+    /// that it is not yet known if the value will be ordered prior to the given ordering value.
+    /// Implementations will ensure that the current task is notified when either the next value is
+    /// ready or once it is known that no such value will be produced.
+    ///
+    /// - `Poll::Ready(Some(Data))` means that the future has successfully terminated.  The
+    /// returned ordering value **may** be greater than the value passed to `before`.  The
+    /// `poll_before` function should not be invoked again.
+    ///
+    /// - `Poll::Ready(None)` means that this future will not produce an ordering token less than
+    /// the given token.  It is an error to return `None` if `before` was `None`.
+    fn poll_before(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        _: Option<&Self::OrderingToken>,
-    ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>> {
-        let this = self.project();
-        let get_token = this.get_token;
-        this.stream.poll_next(cx).map(|opt| match opt {
-            None => JoinableStreamResult::Terminated,
-            Some(item) => {
-                let token = get_token(&item);
-                JoinableStreamResult::Item { item, token }
-            }
-        })
-    }
+        before: Option<&Self::Ordering>,
+    ) -> Poll<Option<(Self::Ordering, Self::Output)>>;
 }
 
-pin_project_lite::pin_project! {
-    /// A stream for the [`into_joinable`] function.
-    #[derive(Debug)]
-    pub struct IntoJoinable<S, F, T> {
-        #[pin]
-        stream: S,
-        get_token: F,
-        last: Option<T>,
-    }
-}
-
-/// Convert a [`Stream`] into a [`JoinableStream`] without using any future knowledge of elements.
-pub fn into_joinable<S, F, T>(stream: S, get_token: F) -> IntoJoinable<S, F, T>
-where
-    S: Stream,
-    F: FnMut(&mut S::Item) -> T,
-    T: Ord + Clone,
-{
-    IntoJoinable {
-        stream,
-        get_token,
-        last: None,
-    }
-}
-
-impl<S, F, T> Stream for IntoJoinable<S, F, T>
-where
-    S: Stream,
-    F: FnMut(&mut S::Item) -> T,
-{
-    type Item = S::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
-        let this = self.project();
-        let get_token = this.get_token;
-        let last = this.last;
-        this.stream.poll_next(cx).map(|opt| {
-            opt.map(|mut item| {
-                *last = Some(get_token(&mut item));
-                item
-            })
-        })
-    }
-}
-
-impl<S, F, T> JoinableStream for IntoJoinable<S, F, T>
-where
-    S: Stream,
-    F: FnMut(&mut S::Item) -> T,
-    T: Ord + Clone,
-{
-    type OrderingToken = T;
-
-    fn poll_next_before(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        before: Option<&Self::OrderingToken>,
-    ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>> {
-        let this = self.project();
-        let get_token = this.get_token;
-        let last = this.last;
-        if let (Some(last), Some(before)) = (last.as_ref(), before) {
-            if last >= before {
-                return Poll::Ready(JoinableStreamResult::NoneBefore);
-            }
-        }
-        this.stream.poll_next(cx).map(|opt| match opt {
-            None => JoinableStreamResult::Terminated,
-            Some(mut item) => {
-                let token = get_token(&mut item);
-                *last = Some(token.clone());
-                JoinableStreamResult::Item { item, token }
-            }
-        })
-    }
-}
-
-pin_project_lite::pin_project! {
-    /// A stream produced by the [`join`] method.
-    #[derive(Debug)]
-    pub struct StreamJoin<A, B>
-    where
-        A: JoinableStream,
-        B: JoinableStream<Item = A::Item, OrderingToken=A::OrderingToken>,
-    {
-        #[pin]
-        stream_a: A,
-        #[pin]
-        stream_b: B,
-        state: JoinState<A::Item, B::Item, A::OrderingToken>,
-    }
-}
-
-/// Join two streams while preserving the overall ordering of elements
-pub fn join<A, B>(stream_a: A, stream_b: B) -> StreamJoin<A, B>
-where
-    A: JoinableStream,
-    B: JoinableStream<Item = A::Item, OrderingToken = A::OrderingToken>,
-{
-    StreamJoin {
-        stream_a,
-        stream_b,
-        state: JoinState::None,
-    }
-}
-
-#[derive(Debug)]
-enum JoinState<A, B, T> {
-    None,
-    A(A, T),
-    B(B, T),
-    OnlyPollA,
-    OnlyPollB,
-    Terminated,
-}
-
-impl<A, B, T> JoinState<A, B, T> {
-    fn take_split(&mut self) -> (PollState<A, T>, PollState<B, T>) {
-        match mem::replace(self, JoinState::None) {
-            JoinState::None => (PollState::Pending, PollState::Pending),
-            JoinState::A(a, t) => (PollState::Item(a, t), PollState::Pending),
-            JoinState::B(b, t) => (PollState::Pending, PollState::Item(b, t)),
-            JoinState::OnlyPollA => (PollState::Pending, PollState::Terminated),
-            JoinState::OnlyPollB => (PollState::Terminated, PollState::Pending),
-            JoinState::Terminated => (PollState::Terminated, PollState::Terminated),
-        }
-    }
-}
-
-impl<A, B> Stream for StreamJoin<A, B>
-where
-    A: JoinableStream,
-    B: JoinableStream<Item = A::Item, OrderingToken = A::OrderingToken>,
-{
-    type Item = A::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<A::Item>> {
-        self.poll_next_before(cx, None).map(|r| r.into_item())
-    }
-}
-
-/// A helper equivalent to Poll<JoinableStreamResult<I, T>> but easier to match
-enum PollState<I, T> {
-    Item(I, T),
-    Pending,
-    NoneBefore,
-    Terminated,
-}
-
-impl<I, T: Ord> PollState<I, T> {
-    fn token(&self) -> Option<&T> {
-        match self {
-            Self::Item(_, t) => Some(t),
-            _ => None,
-        }
-    }
-
-    fn update(
-        &mut self,
-        before: Option<&T>,
-        other_token: Option<&T>,
-        retry: bool,
-        run: impl FnOnce(Option<&T>) -> Poll<JoinableStreamResult<I, T>>,
-    ) -> bool {
-        match self {
-            // Do not re-poll if we have an item already or if we are terminated
-            Self::Item { .. } | Self::Terminated => return false,
-
-            // No need to re-poll if we already declared no items <= before
-            Self::NoneBefore if retry => return false,
-
-            _ => {}
-        }
-
-        // Run the poll with the earlier of the two tokens to avoid transitioning to Pending (which
-        // will stall the StreamJoin) when we could have transitioned to NoneBefore.
-        let token = match (before, other_token) {
-            (Some(u), Some(o)) => {
-                if *u > *o {
-                    // The other token is earlier - so a retry might let us upgrade a Pending to a
-                    // NoneBefore
-                    Some(o)
-                } else if retry {
-                    // A retry will not improve matters, so don't bother
-                    return false;
-                } else {
-                    Some(u)
-                }
-            }
-            (Some(t), None) | (None, Some(t)) => Some(t),
-            (None, None) => None,
-        };
-
-        *self = run(token).into();
-        matches!(self, Self::Item { .. })
-    }
-}
-
-impl<I, T> From<PollState<I, T>> for Poll<JoinableStreamResult<I, T>> {
-    fn from(poll: PollState<I, T>) -> Self {
-        match poll {
-            PollState::Item(item, token) => Poll::Ready(JoinableStreamResult::Item { item, token }),
-            PollState::Pending => Poll::Pending,
-            PollState::NoneBefore => Poll::Ready(JoinableStreamResult::NoneBefore),
-            PollState::Terminated => Poll::Ready(JoinableStreamResult::Terminated),
-        }
-    }
-}
-
-impl<I, T> From<Poll<JoinableStreamResult<I, T>>> for PollState<I, T> {
-    fn from(poll: Poll<JoinableStreamResult<I, T>>) -> Self {
-        match poll {
-            Poll::Ready(JoinableStreamResult::Item { item, token }) => Self::Item(item, token),
-            Poll::Ready(JoinableStreamResult::NoneBefore) => Self::NoneBefore,
-            Poll::Ready(JoinableStreamResult::Terminated) => Self::Terminated,
-            Poll::Pending => Self::Pending,
-        }
-    }
-}
-
-impl<A, B> JoinableStream for StreamJoin<A, B>
-where
-    A: JoinableStream,
-    B: JoinableStream<Item = A::Item, OrderingToken = A::OrderingToken>,
-{
-    type OrderingToken = A::OrderingToken;
-
-    fn poll_next_before(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        before: Option<&Self::OrderingToken>,
-    ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>> {
-        let mut this = self.project();
-        let (mut poll_a, mut poll_b) = this.state.take_split();
-
-        poll_a.update(before, poll_b.token(), false, |token| {
-            this.stream_a.as_mut().poll_next_before(cx, token)
-        });
-        if poll_b.update(before, poll_a.token(), false, |token| {
-            this.stream_b.as_mut().poll_next_before(cx, token)
-        }) {
-            // If B just got an item, it's possible that A already knows that it won't have any
-            // items before that item; we couldn't ask that question before.  Ask it now.
-            poll_a.update(before, poll_b.token(), true, |token| {
-                this.stream_a.as_mut().poll_next_before(cx, token)
-            });
-        }
-
-        match (poll_a, poll_b) {
-            // Both are ready - we can judge ordering directly (simplest case).  The first one is
-            // returned while the other one is buffered for the next poll.
-            (PollState::Item(a, ta), PollState::Item(b, tb)) => {
-                if ta <= tb {
-                    *this.state = JoinState::B(b, tb);
-                    Poll::Ready(JoinableStreamResult::Item { item: a, token: ta })
-                } else {
-                    *this.state = JoinState::A(a, ta);
-                    Poll::Ready(JoinableStreamResult::Item { item: b, token: tb })
-                }
-            }
-
-            // If both sides are terminated, so are we.
-            (PollState::Terminated, PollState::Terminated) => {
-                *this.state = JoinState::Terminated;
-                Poll::Ready(JoinableStreamResult::Terminated)
-            }
-
-            // If one side is terminated, we can produce items directly from the other side.
-            (a, PollState::Terminated) => {
-                *this.state = JoinState::OnlyPollA;
-                a.into()
-            }
-            (PollState::Terminated, b) => {
-                *this.state = JoinState::OnlyPollB;
-                b.into()
-            }
-
-            // If one side is pending, we can't return Ready until that gets resolved.  Because we
-            // have already requested that our child streams wake us when it is possible to make
-            // any kind of progress, we meet the requirements to return Poll::Pending.
-            (PollState::Item(a, t), PollState::Pending) => {
-                *this.state = JoinState::A(a, t);
-                Poll::Pending
-            }
-            (PollState::Pending, PollState::Item(b, t)) => {
-                *this.state = JoinState::B(b, t);
-                Poll::Pending
-            }
-            (PollState::Pending, PollState::Pending) => Poll::Pending,
-            (PollState::Pending, PollState::NoneBefore) => Poll::Pending,
-            (PollState::NoneBefore, PollState::Pending) => Poll::Pending,
-
-            // If both sides report NoneBefore, so can we.
-            (PollState::NoneBefore, PollState::NoneBefore) => {
-                Poll::Ready(JoinableStreamResult::NoneBefore)
-            }
-
-            (PollState::Item(item, token), PollState::NoneBefore) => {
-                // B was polled using either the Some value of (before) or using A's token.
-                //
-                // If before is set and is earlier than A's token, then B might later produce a
-                // value with (bt >= before && bt < at), so we can't return A's item yet and must
-                // buffer it.  However, we can return None because neither stream will produce
-                // items before the token passed in before.
-                //
-                // If before is either None or after A's token, B's NoneBefore return represents a
-                // promise to not produce an item before A's, so we can return A's item now.
-                match before {
-                    Some(before) if token > *before => {
-                        *this.state = JoinState::A(item, token);
-                        Poll::Ready(JoinableStreamResult::NoneBefore)
-                    }
-                    _ => Poll::Ready(JoinableStreamResult::Item { item, token }),
-                }
-            }
-
-            (PollState::NoneBefore, PollState::Item(item, token)) => {
-                // A was polled using either the Some value of (before) or using B's token.
-                //
-                // By a mirror of the above argument, this NoneBefore result gives us permission to
-                // produce either B's item or NoneBefore.
-                match before {
-                    Some(before) if token > *before => {
-                        *this.state = JoinState::B(item, token);
-                        Poll::Ready(JoinableStreamResult::NoneBefore)
-                    }
-                    _ => Poll::Ready(JoinableStreamResult::Item { item, token }),
-                }
-            }
-        }
-    }
-}
-
-impl<A, B> FusedStream for StreamJoin<A, B>
-where
-    A: JoinableStream,
-    B: JoinableStream<Item = A::Item, OrderingToken = A::OrderingToken>,
-{
-    fn is_terminated(&self) -> bool {
-        matches!(self.state, JoinState::Terminated)
-    }
-}
-
-pin_project_lite::pin_project! {
-    /// A stream for the [`map`] function.
-    #[derive(Debug)]
-    pub struct Map<S, F> {
-        #[pin]
-        stream: S,
-        f: F,
-    }
-}
-
-pub fn map<S, F, R>(stream: S, f: F) -> Map<S, F>
-where
-    S: JoinableStream,
-    F: FnMut(S::Item) -> R,
-{
-    Map { stream, f }
-}
-
-impl<S, F, R> Stream for Map<S, F>
-where
-    S: Stream,
-    F: FnMut(S::Item) -> R,
-{
-    type Item = R;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<R>> {
-        let this = self.project();
-        let f = this.f;
-        this.stream.poll_next(cx).map(|opt| opt.map(f))
-    }
-}
-
-impl<S, F, R> JoinableStream for Map<S, F>
-where
-    S: JoinableStream,
-    F: FnMut(S::Item) -> R,
-{
-    type OrderingToken = S::OrderingToken;
-
-    fn poll_next_before(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        before: Option<&Self::OrderingToken>,
-    ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>> {
-        let this = self.project();
-        let f = this.f;
-        this.stream
-            .poll_next_before(cx, before)
-            .map(|res| res.map_item(f))
-    }
-}
-
-pin_project_lite::pin_project! {
-    /// A stream for the [`filter_map`] function.
-    #[derive(Debug)]
-    pub struct FilterMap<S, F> {
-        #[pin]
-        stream: S,
-        filter: F,
-    }
-}
-
-pub fn filter_map<S, F, R>(stream: S, filter: F) -> FilterMap<S, F>
-where
-    S: JoinableStream,
-    F: FnMut(S::Item) -> Option<R>,
-{
-    FilterMap { stream, filter }
-}
-
-pub fn filter<S, F>(
-    stream: S,
-    mut filter: impl FnMut(&S::Item) -> bool,
-) -> FilterMap<S, impl FnMut(S::Item) -> Option<S::Item>>
-where
-    S: JoinableStream,
-{
-    filter_map(
-        stream,
-        move |item| if filter(&item) { Some(item) } else { None },
-    )
-}
-
-impl<S, F, R> Stream for FilterMap<S, F>
-where
-    S: Stream,
-    F: FnMut(S::Item) -> Option<R>,
-{
-    type Item = R;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<R>> {
-        let mut this = self.project();
-        loop {
-            match this.stream.as_mut().poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(item)) => match (this.filter)(item) {
-                    Some(v) => return Poll::Ready(Some(v)),
-                    None => continue,
-                },
-            }
-        }
-    }
-}
-
-impl<S, F, R> JoinableStream for FilterMap<S, F>
-where
-    S: JoinableStream,
-    F: FnMut(S::Item) -> Option<R>,
-{
-    type OrderingToken = S::OrderingToken;
-
-    fn poll_next_before(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        before: Option<&Self::OrderingToken>,
-    ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>> {
-        let mut this = self.project();
-        loop {
-            match this.stream.as_mut().poll_next_before(cx, before).into() {
-                PollState::Pending => return Poll::Pending,
-                PollState::Terminated => return Poll::Ready(JoinableStreamResult::Terminated),
-                PollState::NoneBefore => return Poll::Ready(JoinableStreamResult::NoneBefore),
-                PollState::Item(item, token) => match (this.filter)(item) {
-                    Some(item) => return Poll::Ready(JoinableStreamResult::Item { item, token }),
-                    None => continue,
-                },
-            }
-        }
-    }
-}
-
-pin_project_lite::pin_project! {
-    #[project = ThenProj]
-    #[project_replace = ThenDone]
-    #[derive(Debug)]
-    enum ThenItem<Fut, T> {
-        Running { #[pin] future: Fut, token: T },
-        Idle,
-    }
-}
-
-pin_project_lite::pin_project! {
-    /// A stream for the [`then`] function.
-    #[derive(Debug)]
-    pub struct Then<S, F, Fut>
-        where S: JoinableStream
-    {
-        #[pin]
-        stream: S,
-        then: F,
-        #[pin]
-        future: ThenItem<Fut, S::OrderingToken>,
-    }
-}
-
-pub fn then<S, F, Fut>(stream: S, then: F) -> Then<S, F, Fut>
-where
-    S: JoinableStream,
-    F: FnMut(S::Item) -> Fut,
-    Fut: Future,
-{
-    Then {
-        stream,
-        then,
-        future: ThenItem::Idle,
-    }
-}
-
-impl<S, F, Fut> Stream for Then<S, F, Fut>
-where
-    S: JoinableStream,
-    F: FnMut(S::Item) -> Fut,
-    Fut: Future,
-{
-    type Item = Fut::Output;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.poll_next_before(cx, None).map(|item| item.into_item())
-    }
-}
-
-impl<S, F, Fut> JoinableStream for Then<S, F, Fut>
-where
-    S: JoinableStream,
-    F: FnMut(S::Item) -> Fut,
-    Fut: Future,
-{
-    type OrderingToken = S::OrderingToken;
-
-    fn poll_next_before(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        before: Option<&Self::OrderingToken>,
-    ) -> Poll<JoinableStreamResult<Self::Item, Self::OrderingToken>> {
-        let mut this = self.project();
-        loop {
-            if let ThenProj::Running { future, token } = this.future.as_mut().project() {
-                // Because we know the next token, we can answer questions about it now.
-                if let Some(before) = before {
-                    if *token >= *before {
-                        return Poll::Ready(JoinableStreamResult::NoneBefore);
-                    }
-                }
-
-                if let Poll::Ready(item) = future.poll(cx) {
-                    if let ThenDone::Running { token, .. } =
-                        this.future.as_mut().project_replace(ThenItem::Idle)
-                    {
-                        return Poll::Ready(JoinableStreamResult::Item { item, token });
-                    }
-                } else {
-                    return Poll::Pending;
-                }
-            }
-            match this.stream.as_mut().poll_next_before(cx, before).into() {
-                PollState::Pending => return Poll::Pending,
-                PollState::Terminated => return Poll::Ready(JoinableStreamResult::Terminated),
-                PollState::NoneBefore => return Poll::Ready(JoinableStreamResult::NoneBefore),
-                PollState::Item(item, token) => {
-                    this.future.set(ThenItem::Running {
-                        future: (this.then)(item),
-                        token,
-                    });
-                }
-            }
-        }
-    }
-}
+mod adapters;
+pub use adapters::*;
+mod join;
+pub use join::*;

@@ -212,3 +212,5 @@ mod adapters;
 pub use adapters::*;
 mod join;
 pub use join::*;
+mod multi;
+pub use multi::*;

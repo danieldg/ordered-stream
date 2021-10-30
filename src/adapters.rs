@@ -134,6 +134,16 @@ pub trait OrderedStreamExt: OrderedStream {
             before,
         }
     }
+
+    fn peekable(self) -> Peekable<Self>
+    where
+        Self: Sized,
+    {
+        Peekable {
+            stream: Some(self),
+            item: None,
+        }
+    }
 }
 
 impl<T: ?Sized + OrderedStream> OrderedStreamExt for T {}
@@ -806,5 +816,76 @@ where
     ) -> Poll<PollResult<S::Ordering, S::Data>> {
         let before = self.before;
         self.stream.as_mut().poll_next_before(cx, before)
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// A stream for the [`peekable`](OrderedStreamExt::peekable) function.
+    #[derive(Debug)]
+    pub struct Peekable<S: OrderedStream> {
+        #[pin]
+        stream: Option<S>,
+        item: Option<(S::Ordering, S::Data)>,
+    }
+}
+
+impl<S: OrderedStream> Peekable<S> {
+    /// The current item, without polling
+    pub(crate) fn item(&self) -> Option<&(S::Ordering, S::Data)> {
+        self.item.as_ref()
+    }
+
+    /// Peek on the next item in the stream
+    pub fn poll_peek_before(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        before: Option<&S::Ordering>,
+    ) -> Poll<PollResult<&S::Ordering, &mut S::Data>> {
+        let mut this = self.project();
+        if let Some(stream) = this.stream.as_mut().as_pin_mut() {
+            if this.item.is_none() {
+                match stream.poll_next_before(cx, before) {
+                    Poll::Ready(PollResult::Item { ordering, data }) => {
+                        *this.item = Some((ordering, data));
+                    }
+                    Poll::Ready(PollResult::NoneBefore) => {
+                        return Poll::Ready(PollResult::NoneBefore)
+                    }
+                    Poll::Ready(PollResult::Terminated) => {
+                        this.stream.set(None);
+                        return Poll::Ready(PollResult::Terminated);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        } else {
+            return Poll::Ready(PollResult::Terminated);
+        }
+        let item = this.item.as_mut().unwrap();
+        Poll::Ready(PollResult::Item {
+            ordering: &item.0,
+            data: &mut item.1,
+        })
+    }
+}
+
+impl<S: OrderedStream> OrderedStream for Peekable<S> {
+    type Ordering = S::Ordering;
+    type Data = S::Data;
+
+    fn poll_next_before(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        before: Option<&S::Ordering>,
+    ) -> Poll<PollResult<S::Ordering, S::Data>> {
+        match self.as_mut().poll_peek_before(cx, before) {
+            Poll::Ready(PollResult::Item { .. }) => {
+                let (ordering, data) = self.project().item.take().unwrap();
+                Poll::Ready(PollResult::Item { ordering, data })
+            }
+            Poll::Ready(PollResult::NoneBefore) => Poll::Ready(PollResult::NoneBefore),
+            Poll::Ready(PollResult::Terminated) => Poll::Ready(PollResult::Terminated),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

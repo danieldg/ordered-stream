@@ -57,17 +57,19 @@ where
 ///
 /// This is similar to repeatedly using [`join()`] on all the streams in the contained collection.
 /// It is not optimized to avoid polling streams that are not ready, so it works best if the number
-/// of streams is relatively small or if they are quick to resolve.
+/// of streams is relatively small.
 //
 // Unlike `FutureUnordered` or `SelectAll`, the ordering properties that this struct provides can
 // easily require that all items in the collection be consulted before returning any item.  An
-// example of such a collection is a series of streams that all generate timestamps (locally) for
+// example of such a situation is a series of streams that all generate timestamps (locally) for
 // their items and only return `NoneBefore` for past timestamps.  If only one stream produces an
 // item for each call to `JoinMultiple::poll_next_before`, that timestamp must be checked against
-// every other stream.
+// every other stream, and no amount of preparatory work or hints will help this.
 //
-// On the other hand, if all streams are ready at all times, it is possible to build a priority
-// queue to sort the streams and get a `log(n)` per-item cost.
+// On the other hand, if all streams provide a position hint that matches their next item, it is
+// possible to build a priority queue to sort the streams and reduce the cost of a single poll from
+// `n` to `log(n)`.  This does require maintaining a snapshot of the hints (so S::Ordering: Clone),
+// and will significantly increase the worst-case workload, so it should be a distinct type.
 #[derive(Debug, Default, Clone)]
 pub struct JoinMultiple<C>(pub C);
 impl<C> Unpin for JoinMultiple<C> {}

@@ -215,6 +215,10 @@ where
             }
         })
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
 }
 
 impl<S, F, Ordering, Data> FusedOrderedStream for FromStreamDirect<S, F>
@@ -270,6 +274,10 @@ where
             None => PollResult::Terminated,
             Some(ordering) => PollResult::Item { data: (), ordering },
         })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
     }
 }
 
@@ -363,6 +371,14 @@ where
             }
         })
     }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        self.last.as_ref().map(MaybeBorrowed::Borrowed)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
 }
 
 impl<S, F, Ordering, Data> FusedOrderedStream for FromStream<S, F, Ordering>
@@ -394,6 +410,10 @@ impl<S: OrderedStream> Stream for IntoStream<S> {
             .poll_next_before(cx, None)
             .map(|r| r.into_data())
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
 }
 
 impl<S> FusedStream for IntoStream<S>
@@ -423,6 +443,10 @@ impl<S: OrderedStream> Stream for IntoTupleStream<S> {
             .poll_next_before(cx, None)
             .map(|r| r.into_tuple())
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
 }
 
 impl<S> FusedStream for IntoTupleStream<S>
@@ -451,6 +475,10 @@ impl<S: OrderedStream> Stream for IntoOrdering<S> {
             .stream
             .poll_next_before(cx, None)
             .map(|r| r.into_tuple().map(|t| t.0))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
     }
 }
 
@@ -502,6 +530,18 @@ impl<F: OrderedFuture> OrderedStream for FromFuture<F> {
             None => Poll::Ready(PollResult::Terminated),
         }
     }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        self.future.as_ref().and_then(|f| f.position_hint())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.future.is_some() {
+            (1, Some(1))
+        } else {
+            (0, Some(0))
+        }
+    }
 }
 
 impl<F: OrderedFuture> FusedOrderedStream for FromFuture<F> {
@@ -538,6 +578,14 @@ where
         this.stream
             .poll_next_before(cx, before)
             .map(|res| res.map_data(f))
+    }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        self.stream.position_hint()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
     }
 }
 
@@ -576,6 +624,14 @@ where
                 PollResult::NoneBefore => PollResult::NoneBefore,
                 PollResult::Terminated => PollResult::Terminated,
             })
+    }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        self.stream.position_hint()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
     }
 }
 
@@ -618,6 +674,10 @@ where
                 PollResult::Terminated => PollResult::Terminated,
             })
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
 }
 
 pin_project_lite::pin_project! {
@@ -657,6 +717,14 @@ where
             }
         }
     }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        self.stream.position_hint()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.stream.size_hint().1)
+    }
 }
 
 pin_project_lite::pin_project! {
@@ -694,6 +762,14 @@ where
                 },
             }
         }
+    }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        self.stream.position_hint()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.stream.size_hint().1)
     }
 }
 
@@ -766,6 +842,21 @@ where
                     });
                 }
             }
+        }
+    }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        match &self.future {
+            ThenItem::Running { ordering, .. } => Some(MaybeBorrowed::Borrowed(ordering)),
+            ThenItem::Idle => self.stream.position_hint(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (min, max) = self.stream.size_hint();
+        match self.future {
+            ThenItem::Running { .. } => (min.saturating_add(1), max.and_then(|v| v.checked_add(1))),
+            ThenItem::Idle => (min, max),
         }
     }
 }
@@ -886,6 +977,25 @@ impl<S: OrderedStream> OrderedStream for Peekable<S> {
             Poll::Ready(PollResult::NoneBefore) => Poll::Ready(PollResult::NoneBefore),
             Poll::Ready(PollResult::Terminated) => Poll::Ready(PollResult::Terminated),
             Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        match &self.item {
+            Some((ordering, _)) => Some(MaybeBorrowed::Borrowed(ordering)),
+            None => self.stream.as_ref().and_then(|s| s.position_hint()),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (min, max) = match &self.stream {
+            Some(stream) => stream.size_hint(),
+            None => (0, Some(0)),
+        };
+        if self.item.is_some() {
+            (min.saturating_add(1), max.and_then(|v| v.checked_add(1)))
+        } else {
+            (min, max)
         }
     }
 }

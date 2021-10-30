@@ -73,6 +73,51 @@ pub trait OrderedStream {
         cx: &mut Context<'_>,
         before: Option<&Self::Ordering>,
     ) -> Poll<PollResult<Self::Ordering, Self::Data>>;
+
+    /// The minimum value of the ordering for any future items.
+    ///
+    /// If this does not return `None`, the returned ordering must be less than or equal to the
+    /// ordering of any future item returned from [`Self::poll_next_before`].  This value should
+    /// (but is not required to) be greater than or equal to the ordering of the most recent item
+    /// returned.
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        None
+    }
+
+    /// Returns the bounds on the remaining length of the stream.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+/// A value that is either borrowed or owned.
+///
+/// This is similar to `std::borrow::Cow`, but does not require the ability to convert from
+/// borrowed to owned.
+#[derive(Debug)]
+pub enum MaybeBorrowed<'a, T> {
+    Borrowed(&'a T),
+    Owned(T),
+}
+
+impl<'a, T> AsRef<T> for MaybeBorrowed<'a, T> {
+    fn as_ref(&self) -> &T {
+        match self {
+            Self::Borrowed(t) => t,
+            Self::Owned(t) => t,
+        }
+    }
+}
+
+impl<'a, T> core::ops::Deref for MaybeBorrowed<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Borrowed(t) => t,
+            Self::Owned(t) => t,
+        }
+    }
 }
 
 impl<P> OrderedStream for Pin<P>
@@ -89,6 +134,14 @@ where
         before: Option<&Self::Ordering>,
     ) -> Poll<PollResult<Self::Ordering, Self::Data>> {
         self.get_mut().as_mut().poll_next_before(cx, before)
+    }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        (**self).position_hint()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (**self).size_hint()
     }
 }
 
@@ -206,6 +259,13 @@ pub trait OrderedFuture {
         cx: &mut Context<'_>,
         before: Option<&Self::Ordering>,
     ) -> Poll<Option<(Self::Ordering, Self::Output)>>;
+
+    /// The minimum value of the ordering of the item.
+    ///
+    /// See [`OrderedStream::position_hint`] for details.
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        None
+    }
 }
 
 mod adapters;

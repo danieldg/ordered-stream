@@ -255,6 +255,47 @@ where
             }
         }
     }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        let (a, b) = match &self.state {
+            JoinState::None => (self.stream_a.position_hint(), self.stream_b.position_hint()),
+            JoinState::A(_, t) => (
+                Some(MaybeBorrowed::Borrowed(t)),
+                self.stream_b.position_hint(),
+            ),
+            JoinState::B(_, t) => (
+                self.stream_b.position_hint(),
+                Some(MaybeBorrowed::Borrowed(t)),
+            ),
+            JoinState::OnlyPollA => return self.stream_a.position_hint(),
+            JoinState::OnlyPollB => return self.stream_b.position_hint(),
+            JoinState::Terminated => return None,
+        };
+        // We can only provide a hint if we have a valid hint for both sides
+        match (a, b) {
+            (Some(a), Some(b)) if *a <= *b => Some(a),
+            (Some(_), Some(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let extra = match &self.state {
+            JoinState::None => 0,
+            JoinState::A { .. } => 1,
+            JoinState::B { .. } => 1,
+            JoinState::OnlyPollA => return self.stream_a.size_hint(),
+            JoinState::OnlyPollB => return self.stream_b.size_hint(),
+            JoinState::Terminated => return (0, Some(0)),
+        };
+        let (al, ah) = self.stream_a.size_hint();
+        let (bl, bh) = self.stream_b.size_hint();
+        let min = al.saturating_add(bl).saturating_add(extra);
+        let max = ah
+            .and_then(|a| bh.and_then(|b| a.checked_add(b)))
+            .and_then(|h| h.checked_add(extra));
+        (min, max)
+    }
 }
 
 impl<A, B> FusedOrderedStream for Join<A, B>

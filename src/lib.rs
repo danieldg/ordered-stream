@@ -15,6 +15,45 @@
 //! The [`OrderedStream`] trait provides a way to solve this problem: if you can ask a stream if it
 //! will ever have any events that should be delivered before a given event, then you can often
 //! avoid blocking the composite stream when data is ready.
+//!
+//! ```
+//! use futures_core::Stream;
+//! use ordered_stream::FromStream;
+//! use ordered_stream::JoinMultiple;
+//! use ordered_stream::OrderedStream;
+//! use ordered_stream::OrderedStreamExt;
+//! use std::pin::Pin;
+//! use std::time::SystemTime;
+//!
+//! pub struct Message {
+//!     time: SystemTime,
+//!     level: u8,
+//!     data: String,
+//!     source: String,
+//! }
+//!
+//! pub struct RemoteLogSource {
+//!     stream: Pin<Box<dyn Stream<Item = Message>>>,
+//!     min_level: u8,
+//! }
+//!
+//! pub async fn display_logs(logs: &mut [RemoteLogSource]) {
+//!     let mut streams: Vec<_> = logs
+//!         .iter_mut()
+//!         .map(|s| {
+//!             let min = s.min_level;
+//!             FromStream::with_ordering(&mut s.stream, |m| m.time)
+//!                 .filter(move |m| m.level >= min)
+//!                 .peekable()
+//!         })
+//!         .collect();
+//!     let mut joined = JoinMultiple(streams);
+//!     while let Some(msg) = joined.next().await {
+//!         println!("{:?}: {}", msg.time, msg.data);
+//!     }
+//! }
+//!
+//! ```
 use core::pin::Pin;
 use core::task::{Context, Poll};
 

@@ -49,7 +49,7 @@ pub trait OrderedStreamExt: OrderedStream {
         }
     }
 
-    fn filter<F, R>(self, filter: F) -> Filter<Self, F>
+    fn filter<F>(self, filter: F) -> Filter<Self, F>
     where
         Self: Sized,
         F: FnMut(&Self::Data) -> bool,

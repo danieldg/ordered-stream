@@ -139,6 +139,26 @@ impl<I, T> From<Poll<PollResult<T, I>>> for PollState<I, T> {
     }
 }
 
+impl<A, B> Join<A, B>
+where
+    A: OrderedStream,
+    B: OrderedStream<Data = A::Data, Ordering = A::Ordering>,
+{
+    /// Split into the source streams.
+    ///
+    /// This method returns the source streams along with any buffered item and its
+    /// ordering.
+    pub fn into_inner(self) -> (A, B, Option<(A::Data, A::Ordering)>) {
+        let item = match self.state {
+            JoinState::A(a, o) => Some((a, o)),
+            JoinState::B(b, o) => Some((b, o)),
+            _ => None,
+        };
+
+        (self.stream_a, self.stream_b, item)
+    }
+}
+
 impl<A, B> OrderedStream for Join<A, B>
 where
     A: OrderedStream,

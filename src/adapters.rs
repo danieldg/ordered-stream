@@ -560,6 +560,13 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S, F> Map<S, F> {
+    /// Convert to source stream.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+}
+
 impl<S, F, R> OrderedStream for Map<S, F>
 where
     S: OrderedStream,

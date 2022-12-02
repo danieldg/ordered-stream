@@ -1,3 +1,5 @@
+[![](https://docs.rs/ordered-stream/badge.svg)](https://docs.rs/ordered-stream/) [![](https://img.shields.io/crates/v/ordered-stream)](https://crates.io/crates/ordered-stream)
+
 # Streams that produce elements with an associated ordering
 
  Say you have a bunch of events that all have a timestamp, sequence number, or other ordering

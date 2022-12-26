@@ -16,7 +16,7 @@ where
     // The stream with the earliest item that is actually before the given point
     let mut best: Option<Pin<P>> = None;
     let mut has_data = false;
-    let mut has_pending = true;
+    let mut has_pending = false;
     for mut stream in streams {
         let best_before = best.as_ref().and_then(|p| p.item().map(|i| &i.0));
         let before = match (before, best_before) {
@@ -32,24 +32,20 @@ where
             Poll::Ready(PollResult::NoneBefore) => {
                 has_data = true;
             }
-            Poll::Ready(PollResult::Item { ordering, .. }) => {
-                match before {
-                    // skip the compare if it doesn't matter
-                    _ if has_pending => continue,
-                    Some(max) if max < ordering => continue,
-                    _ => {
-                        best = Some(stream);
-                    }
+            Poll::Ready(PollResult::Item { ordering, .. }) => match before {
+                Some(max) if max < ordering => continue,
+                _ => {
+                    best = Some(stream);
                 }
-            }
+            },
         }
     }
     match best {
-        _ if has_pending => Poll::Pending,
+        None if has_data => Poll::Ready(PollResult::NoneBefore),
+        None if has_pending => Poll::Pending,
+        None => Poll::Ready(PollResult::Terminated),
         // This is guaranteed to return PollResult::Item
         Some(mut stream) => stream.as_mut().poll_next_before(cx, before),
-        None if has_data => Poll::Ready(PollResult::NoneBefore),
-        None => Poll::Ready(PollResult::Terminated),
     }
 }
 

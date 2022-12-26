@@ -127,3 +127,55 @@ where
         poll_multiple(self.as_pin_mut(), cx, before)
     }
 }
+
+#[cfg(test)]
+mod test {
+    extern crate alloc;
+
+    use crate::FromStream;
+    use crate::JoinMultiple;
+    use crate::OrderedStreamExt;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use core::pin::Pin;
+    use futures_core::Stream;
+
+    #[test]
+    fn join_mutiple() {
+        futures_executor::block_on(async {
+            pub struct Message {
+                serial: u32,
+            }
+
+            pub struct RemoteLogSource {
+                stream: Pin<Box<dyn Stream<Item = Message>>>,
+            }
+
+            let mut logs = [
+                RemoteLogSource {
+                    stream: Box::pin(futures_util::stream::iter([
+                        Message { serial: 1 },
+                        Message { serial: 3 },
+                        Message { serial: 5 },
+                    ])),
+                },
+                RemoteLogSource {
+                    stream: Box::pin(futures_util::stream::iter([
+                        Message { serial: 2 },
+                        Message { serial: 4 },
+                        Message { serial: 6 },
+                    ])),
+                },
+            ];
+            let streams: Vec<_> = logs
+                .iter_mut()
+                .map(|s| FromStream::with_ordering(&mut s.stream, |m| m.serial).peekable())
+                .collect();
+            let mut joined = JoinMultiple(streams);
+            for i in 0..6 {
+                let msg = joined.next().await.unwrap();
+                assert_eq!(msg.serial, i as u32 + 1);
+            }
+        });
+    }
+}

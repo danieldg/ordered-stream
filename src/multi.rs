@@ -86,6 +86,17 @@ where
     }
 }
 
+impl<C, S> FusedOrderedStream for JoinMultiple<C>
+where
+    for<'a> &'a mut C: IntoIterator<Item = &'a mut Peekable<S>>,
+    for<'a> &'a C: IntoIterator<Item = &'a Peekable<S>>,
+    S: OrderedStream + Unpin,
+{
+    fn is_terminated(&self) -> bool {
+        self.0.into_iter().all(|peekable| peekable.is_terminated())
+    }
+}
+
 pin_project_lite::pin_project! {
     /// Join a collection of pinned [`OrderedStream`]s.
     ///

@@ -12,3 +12,7 @@ keywords = ["async", "stream", "timestamp"]
 [dependencies]
 futures-core = "0.3"
 pin-project-lite = "0.2"
+
+[dev-dependencies]
+futures-executor = "0.3.25"
+futures-util = "0.3.25"

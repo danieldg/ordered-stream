@@ -275,17 +275,6 @@ where
                 b.into()
             }
 
-            // If one side is pending, we can't return Ready until that gets resolved.  Because we
-            // have already requested that our child streams wake us when it is possible to make
-            // any kind of progress, we meet the requirements to return Poll::Pending.
-            (PollState::Item(a, t), PollState::Pending) => {
-                *this.state = JoinState::A(a, t);
-                Poll::Pending
-            }
-            (PollState::Pending, PollState::Item(b, t)) => {
-                *this.state = JoinState::B(b, t);
-                Poll::Pending
-            }
             (PollState::Pending, PollState::Pending) => Poll::Pending,
             (PollState::Pending, PollState::NoneBefore) => Poll::Pending,
             (PollState::NoneBefore, PollState::Pending) => Poll::Pending,
@@ -293,8 +282,9 @@ where
             // If both sides report NoneBefore, so can we.
             (PollState::NoneBefore, PollState::NoneBefore) => Poll::Ready(PollResult::NoneBefore),
 
-            (PollState::Item(data, ordering), PollState::NoneBefore) => {
-                // B was polled using either the Some value of (before) or using A's ordering.
+            (PollState::Item(data, ordering), PollState::NoneBefore | PollState::Pending) => {
+                // B was polled using either the Some value of (before) or using A's ordering, or A
+                // is ready while B is Pending.
                 //
                 // If before is set and is earlier than A's ordering, then B might later produce a
                 // value with (bt >= before && bt < at), so we can't return A's item yet and must
@@ -312,8 +302,9 @@ where
                 }
             }
 
-            (PollState::NoneBefore, PollState::Item(data, ordering)) => {
-                // A was polled using either the Some value of (before) or using B's ordering.
+            (PollState::NoneBefore | PollState::Pending, PollState::Item(data, ordering)) => {
+                // A was polled using either the Some value of (before) or using B's ordering, or B
+                // is ready while A is Pending.
                 //
                 // By a mirror of the above argument, this NoneBefore result gives us permission to
                 // produce either B's item or NoneBefore.

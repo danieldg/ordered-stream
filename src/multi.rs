@@ -16,7 +16,7 @@ where
     // The stream with the earliest item that is actually before the given point
     let mut best: Option<Pin<P>> = None;
     let mut has_data = false;
-    let mut has_pending = true;
+    let mut has_pending = false;
     for mut stream in streams {
         let best_before = best.as_ref().and_then(|p| p.item().map(|i| &i.0));
         let before = match (before, best_before) {
@@ -32,24 +32,20 @@ where
             Poll::Ready(PollResult::NoneBefore) => {
                 has_data = true;
             }
-            Poll::Ready(PollResult::Item { ordering, .. }) => {
-                match before {
-                    // skip the compare if it doesn't matter
-                    _ if has_pending => continue,
-                    Some(max) if max < ordering => continue,
-                    _ => {
-                        best = Some(stream);
-                    }
+            Poll::Ready(PollResult::Item { ordering, .. }) => match before {
+                Some(max) if max < ordering => continue,
+                _ => {
+                    best = Some(stream);
                 }
-            }
+            },
         }
     }
     match best {
-        _ if has_pending => Poll::Pending,
+        None if has_data => Poll::Ready(PollResult::NoneBefore),
+        None if has_pending => Poll::Pending,
+        None => Poll::Ready(PollResult::Terminated),
         // This is guaranteed to return PollResult::Item
         Some(mut stream) => stream.as_mut().poll_next_before(cx, before),
-        None if has_data => Poll::Ready(PollResult::NoneBefore),
-        None => Poll::Ready(PollResult::Terminated),
     }
 }
 
@@ -90,6 +86,17 @@ where
     }
 }
 
+impl<C, S> FusedOrderedStream for JoinMultiple<C>
+where
+    for<'a> &'a mut C: IntoIterator<Item = &'a mut Peekable<S>>,
+    for<'a> &'a C: IntoIterator<Item = &'a Peekable<S>>,
+    S: OrderedStream + Unpin,
+{
+    fn is_terminated(&self) -> bool {
+        self.0.into_iter().all(|peekable| peekable.is_terminated())
+    }
+}
+
 pin_project_lite::pin_project! {
     /// Join a collection of pinned [`OrderedStream`]s.
     ///
@@ -125,5 +132,57 @@ where
         before: Option<&S::Ordering>,
     ) -> Poll<PollResult<S::Ordering, S::Data>> {
         poll_multiple(self.as_pin_mut(), cx, before)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    extern crate alloc;
+
+    use crate::FromStream;
+    use crate::JoinMultiple;
+    use crate::OrderedStreamExt;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use core::pin::Pin;
+    use futures_core::Stream;
+
+    #[test]
+    fn join_mutiple() {
+        futures_executor::block_on(async {
+            pub struct Message {
+                serial: u32,
+            }
+
+            pub struct RemoteLogSource {
+                stream: Pin<Box<dyn Stream<Item = Message>>>,
+            }
+
+            let mut logs = [
+                RemoteLogSource {
+                    stream: Box::pin(futures_util::stream::iter([
+                        Message { serial: 1 },
+                        Message { serial: 3 },
+                        Message { serial: 5 },
+                    ])),
+                },
+                RemoteLogSource {
+                    stream: Box::pin(futures_util::stream::iter([
+                        Message { serial: 2 },
+                        Message { serial: 4 },
+                        Message { serial: 6 },
+                    ])),
+                },
+            ];
+            let streams: Vec<_> = logs
+                .iter_mut()
+                .map(|s| FromStream::with_ordering(&mut s.stream, |m| m.serial).peekable())
+                .collect();
+            let mut joined = JoinMultiple(streams);
+            for i in 0..6 {
+                let msg = joined.next().await.unwrap();
+                assert_eq!(msg.serial, i as u32 + 1);
+            }
+        });
     }
 }

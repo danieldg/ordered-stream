@@ -1006,3 +1006,9 @@ impl<S: OrderedStream> OrderedStream for Peekable<S> {
         }
     }
 }
+
+impl<S: OrderedStream> FusedOrderedStream for Peekable<S> {
+    fn is_terminated(&self) -> bool {
+        self.stream.is_none()
+    }
+}

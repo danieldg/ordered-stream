@@ -162,14 +162,14 @@ mod test {
                 RemoteLogSource {
                     stream: Box::pin(futures_util::stream::iter([
                         Message { serial: 1 },
-                        Message { serial: 3 },
+                        Message { serial: 4 },
                         Message { serial: 5 },
                     ])),
                 },
                 RemoteLogSource {
                     stream: Box::pin(futures_util::stream::iter([
                         Message { serial: 2 },
-                        Message { serial: 4 },
+                        Message { serial: 3 },
                         Message { serial: 6 },
                     ])),
                 },

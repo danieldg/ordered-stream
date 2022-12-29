@@ -382,6 +382,9 @@ where
 
 #[cfg(test)]
 mod test {
+    use futures_executor::block_on;
+    use futures_util::stream::iter;
+
     use crate::join;
     use crate::FromStream;
     use crate::OrderedStreamExt;
@@ -392,14 +395,14 @@ mod test {
 
     #[test]
     fn join_two() {
-        futures_executor::block_on(async {
-            let stream1 = futures_util::stream::iter([
+        block_on(async {
+            let stream1 = iter([
                 Message { serial: 1 },
                 Message { serial: 4 },
                 Message { serial: 5 },
             ]);
 
-            let stream2 = futures_util::stream::iter([
+            let stream2 = iter([
                 Message { serial: 2 },
                 Message { serial: 3 },
                 Message { serial: 6 },

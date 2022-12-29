@@ -146,6 +146,7 @@ mod test {
     use alloc::vec::Vec;
     use core::pin::Pin;
     use futures_core::Stream;
+    use futures_util::stream::iter;
 
     #[test]
     fn join_mutiple() {
@@ -160,14 +161,14 @@ mod test {
 
             let mut logs = [
                 RemoteLogSource {
-                    stream: Box::pin(futures_util::stream::iter([
+                    stream: Box::pin(iter([
                         Message { serial: 1 },
                         Message { serial: 4 },
                         Message { serial: 5 },
                     ])),
                 },
                 RemoteLogSource {
-                    stream: Box::pin(futures_util::stream::iter([
+                    stream: Box::pin(iter([
                         Message { serial: 2 },
                         Message { serial: 3 },
                         Message { serial: 6 },

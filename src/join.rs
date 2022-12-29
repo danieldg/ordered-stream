@@ -275,17 +275,6 @@ where
                 b.into()
             }
 
-            // If one side is pending, we can't return Ready until that gets resolved.  Because we
-            // have already requested that our child streams wake us when it is possible to make
-            // any kind of progress, we meet the requirements to return Poll::Pending.
-            (PollState::Item(a, t), PollState::Pending) => {
-                *this.state = JoinState::A(a, t);
-                Poll::Pending
-            }
-            (PollState::Pending, PollState::Item(b, t)) => {
-                *this.state = JoinState::B(b, t);
-                Poll::Pending
-            }
             (PollState::Pending, PollState::Pending) => Poll::Pending,
             (PollState::Pending, PollState::NoneBefore) => Poll::Pending,
             (PollState::NoneBefore, PollState::Pending) => Poll::Pending,
@@ -293,8 +282,9 @@ where
             // If both sides report NoneBefore, so can we.
             (PollState::NoneBefore, PollState::NoneBefore) => Poll::Ready(PollResult::NoneBefore),
 
-            (PollState::Item(data, ordering), PollState::NoneBefore) => {
-                // B was polled using either the Some value of (before) or using A's ordering.
+            (PollState::Item(data, ordering), PollState::NoneBefore | PollState::Pending) => {
+                // B was polled using either the Some value of (before) or using A's ordering, or A
+                // is ready while B is Pending.
                 //
                 // If before is set and is earlier than A's ordering, then B might later produce a
                 // value with (bt >= before && bt < at), so we can't return A's item yet and must
@@ -312,8 +302,9 @@ where
                 }
             }
 
-            (PollState::NoneBefore, PollState::Item(data, ordering)) => {
-                // A was polled using either the Some value of (before) or using B's ordering.
+            (PollState::NoneBefore | PollState::Pending, PollState::Item(data, ordering)) => {
+                // A was polled using either the Some value of (before) or using B's ordering, or B
+                // is ready while A is Pending.
                 //
                 // By a mirror of the above argument, this NoneBefore result gives us permission to
                 // produce either B's item or NoneBefore.
@@ -382,6 +373,12 @@ where
 
 #[cfg(test)]
 mod test {
+    extern crate alloc;
+
+    use alloc::boxed::Box;
+    use futures_executor::block_on;
+    use futures_util::stream::{iter, once, pending};
+
     use crate::join;
     use crate::FromStream;
     use crate::OrderedStreamExt;
@@ -392,16 +389,16 @@ mod test {
 
     #[test]
     fn join_two() {
-        futures_executor::block_on(async {
-            let stream1 = futures_util::stream::iter([
+        block_on(async {
+            let stream1 = iter([
                 Message { serial: 1 },
-                Message { serial: 3 },
+                Message { serial: 4 },
                 Message { serial: 5 },
             ]);
 
-            let stream2 = futures_util::stream::iter([
+            let stream2 = iter([
                 Message { serial: 2 },
-                Message { serial: 4 },
+                Message { serial: 3 },
                 Message { serial: 6 },
             ]);
             let mut joined = join(
@@ -412,6 +409,20 @@ mod test {
                 let msg = joined.next().await.unwrap();
                 assert_eq!(msg.serial, i as u32 + 1);
             }
+        });
+    }
+
+    #[test]
+    fn join_1_pending() {
+        block_on(async {
+            let stream1 = FromStream::with_ordering(pending::<Message>(), |m| m.serial);
+            let stream2 =
+                FromStream::with_ordering(once(Box::pin(async { Message { serial: 1 } })), |m| {
+                    m.serial
+                });
+            let mut joined = join(stream1, stream2);
+            let msg = joined.next().await.unwrap();
+            assert_eq!(msg.serial, 1);
         });
     }
 }

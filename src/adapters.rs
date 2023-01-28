@@ -140,8 +140,9 @@ pub trait OrderedStreamExt: OrderedStream {
         Self: Sized,
     {
         Peekable {
-            stream: Some(self),
+            stream: self,
             item: None,
+            is_terminated: false,
         }
     }
 }
@@ -922,12 +923,21 @@ pin_project_lite::pin_project! {
     #[derive(Debug)]
     pub struct Peekable<S: OrderedStream> {
         #[pin]
-        stream: Option<S>,
+        stream: S,
+        is_terminated: bool,
         item: Option<(S::Ordering, S::Data)>,
     }
 }
 
 impl<S: OrderedStream> Peekable<S> {
+    /// Convert into the source stream.
+    ///
+    /// This method returns the source stream along with any buffered item and its
+    /// ordering.
+    pub fn into_inner(self) -> (S, Option<(S::Data, S::Ordering)>) {
+        (self.stream, self.item.map(|(o, d)| (d, o)))
+    }
+
     /// The current item, without polling
     pub(crate) fn item(&self) -> Option<&(S::Ordering, S::Data)> {
         self.item.as_ref()
@@ -940,24 +950,22 @@ impl<S: OrderedStream> Peekable<S> {
         before: Option<&S::Ordering>,
     ) -> Poll<PollResult<&S::Ordering, &mut S::Data>> {
         let mut this = self.project();
-        if let Some(stream) = this.stream.as_mut().as_pin_mut() {
-            if this.item.is_none() {
-                match stream.poll_next_before(cx, before) {
-                    Poll::Ready(PollResult::Item { ordering, data }) => {
-                        *this.item = Some((ordering, data));
-                    }
-                    Poll::Ready(PollResult::NoneBefore) => {
-                        return Poll::Ready(PollResult::NoneBefore)
-                    }
-                    Poll::Ready(PollResult::Terminated) => {
-                        this.stream.set(None);
-                        return Poll::Ready(PollResult::Terminated);
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        } else {
+        if *this.is_terminated {
             return Poll::Ready(PollResult::Terminated);
+        }
+        let stream = this.stream.as_mut();
+        if this.item.is_none() {
+            match stream.poll_next_before(cx, before) {
+                Poll::Ready(PollResult::Item { ordering, data }) => {
+                    *this.item = Some((ordering, data));
+                }
+                Poll::Ready(PollResult::NoneBefore) => return Poll::Ready(PollResult::NoneBefore),
+                Poll::Ready(PollResult::Terminated) => {
+                    *this.is_terminated = true;
+                    return Poll::Ready(PollResult::Terminated);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
         let item = this.item.as_mut().unwrap();
         Poll::Ready(PollResult::Item {
@@ -990,14 +998,15 @@ impl<S: OrderedStream> OrderedStream for Peekable<S> {
     fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
         match &self.item {
             Some((ordering, _)) => Some(MaybeBorrowed::Borrowed(ordering)),
-            None => self.stream.as_ref().and_then(|s| s.position_hint()),
+            None => self.stream.position_hint(),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let (min, max) = match &self.stream {
-            Some(stream) => stream.size_hint(),
-            None => (0, Some(0)),
+        let (min, max) = if self.is_terminated {
+            (0, Some(0))
+        } else {
+            self.stream.size_hint()
         };
         if self.item.is_some() {
             (min.saturating_add(1), max.and_then(|v| v.checked_add(1)))
@@ -1009,6 +1018,6 @@ impl<S: OrderedStream> OrderedStream for Peekable<S> {
 
 impl<S: OrderedStream> FusedOrderedStream for Peekable<S> {
     fn is_terminated(&self) -> bool {
-        self.stream.is_none()
+        self.is_terminated
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ordered-stream"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["Daniel De Graaf <code@danieldg.net>", "Zeeshan Ali Khan <zeeshanak@gnome.org>"]
 license = "MIT OR Apache-2.0"
 edition = "2018"

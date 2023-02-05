@@ -138,7 +138,7 @@ pub trait FusedOrderedStream: OrderedStream {
 }
 
 /// The result of a [`OrderedStream::poll_next_before`] operation.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum PollResult<Ordering, Data> {
     /// An item with a corresponding ordering token.
     Item { data: Data, ordering: Ordering },

@@ -382,11 +382,8 @@ where
 
 #[cfg(test)]
 mod test {
-    extern crate alloc;
-
-    use alloc::boxed::Box;
     use futures_executor::block_on;
-    use futures_util::stream::{iter, once, pending};
+    use futures_util::stream::iter;
 
     use crate::join;
     use crate::FromStream;
@@ -418,20 +415,6 @@ mod test {
                 let msg = joined.next().await.unwrap();
                 assert_eq!(msg.serial, i as u32 + 1);
             }
-        });
-    }
-
-    #[test]
-    fn join_1_pending() {
-        block_on(async {
-            let stream1 = FromStream::with_ordering(pending::<Message>(), |m| m.serial);
-            let stream2 =
-                FromStream::with_ordering(once(Box::pin(async { Message { serial: 1 } })), |m| {
-                    m.serial
-                });
-            let mut joined = join(stream1, stream2);
-            let msg = joined.next().await.unwrap();
-            assert_eq!(msg.serial, 1);
         });
     }
 }

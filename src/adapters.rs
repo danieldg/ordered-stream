@@ -607,6 +607,13 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S, F> MapItem<S, F> {
+    /// Convert to source stream.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+}
+
 impl<S, F, R> OrderedStream for MapItem<S, F>
 where
     S: OrderedStream,
@@ -650,6 +657,13 @@ pin_project_lite::pin_project! {
         #[pin]
         stream: S,
         map_into: MapInto, map_from: MapFrom,
+    }
+}
+
+impl<S, I, F> MapOrdering<S, I, F> {
+    /// Convert to source stream.
+    pub fn into_inner(self) -> S {
+        self.stream
     }
 }
 
@@ -698,6 +712,13 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S, F> Filter<S, F> {
+    /// Convert to source stream.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+}
+
 impl<S, F> OrderedStream for Filter<S, F>
 where
     S: OrderedStream,
@@ -742,6 +763,13 @@ pin_project_lite::pin_project! {
         #[pin]
         stream: S,
         filter: F,
+    }
+}
+
+impl<S, F> FilterMap<S, F> {
+    /// Convert to source stream.
+    pub fn into_inner(self) -> S {
+        self.stream
     }
 }
 

@@ -3,42 +3,69 @@ use core::ops::DerefMut;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-fn poll_multiple<I, P, S>(
+fn poll_multiple_step<I, P, S>(
     streams: I,
     cx: &mut Context<'_>,
     before: Option<&S::Ordering>,
+    mut retry: Option<&mut Option<S::Ordering>>,
 ) -> Poll<PollResult<S::Ordering, S::Data>>
 where
     I: IntoIterator<Item = Pin<P>>,
     P: DerefMut<Target = Peekable<S>>,
     S: OrderedStream,
+    S::Ordering: Clone,
 {
     // The stream with the earliest item that is actually before the given point
     let mut best: Option<Pin<P>> = None;
+    // true if we have a stream that has not terminated
     let mut has_data = false;
     let mut has_pending = false;
+    let mut skip_retry = false;
     for mut stream in streams {
         let best_before = best.as_ref().and_then(|p| p.item().map(|i| &i.0));
-        let before = match (before, best_before) {
-            (Some(a), Some(b)) if a < b => Some(a),
-            (_, Some(b)) => Some(b),
-            (a, None) => a,
+        let current_bound = match (before, best_before) {
+            (Some(given), Some(best)) if given <= best => Some(given),
+            (_, Some(best)) => Some(best),
+            (given, None) => given,
         };
-        match stream.as_mut().poll_peek_before(cx, before) {
+        // improved is true if have improved the `before` bound from the initial value
+
+        match stream.as_mut().poll_peek_before(cx, current_bound) {
             Poll::Pending => {
                 has_pending = true;
+                skip_retry = true;
             }
             Poll::Ready(PollResult::Terminated) => continue,
             Poll::Ready(PollResult::NoneBefore) => {
                 has_data = true;
             }
-            Poll::Ready(PollResult::Item { ordering, .. }) => match before {
-                Some(max) if max < ordering => continue,
-                _ => {
-                    best = Some(stream);
+            Poll::Ready(PollResult::Item { ordering, .. }) => {
+                has_data = true;
+                match current_bound {
+                    Some(max) if max < ordering => continue,
+                    _ => {}
                 }
-            },
+                match (&mut retry, before, has_pending) {
+                    (Some(retry), Some(initial_bound), true) if ordering < initial_bound => {
+                        // We have just improved the initial bound, so the streams that
+                        // previously returned Pending might be able to return NoneBefore in a
+                        // retry.  This is only useful if there are no later Pending returns, so
+                        // those will set skip_retry.
+                        **retry = Some(ordering.clone());
+                        skip_retry = false;
+                    }
+                    (Some(retry), None, true) => {
+                        **retry = Some(ordering.clone());
+                        skip_retry = false;
+                    }
+                    _ => {}
+                }
+                best = Some(stream);
+            }
         }
+    }
+    if skip_retry {
+        retry.map(|r| *r = None);
     }
     match best {
         _ if has_pending => Poll::Pending,
@@ -74,15 +101,32 @@ impl<C, S> OrderedStream for JoinMultiple<C>
 where
     for<'a> &'a mut C: IntoIterator<Item = &'a mut Peekable<S>>,
     S: OrderedStream + Unpin,
+    S::Ordering: Clone,
 {
     type Ordering = S::Ordering;
     type Data = S::Data;
     fn poll_next_before(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         before: Option<&S::Ordering>,
     ) -> Poll<PollResult<S::Ordering, S::Data>> {
-        poll_multiple(self.get_mut().0.into_iter().map(Pin::new), cx, before)
+        let mut retry = None;
+        let rv = poll_multiple_step(
+            self.as_mut().get_mut().0.into_iter().map(Pin::new),
+            cx,
+            before,
+            Some(&mut retry),
+        );
+        if rv.is_pending() && retry.is_some() {
+            poll_multiple_step(
+                self.get_mut().0.into_iter().map(Pin::new),
+                cx,
+                retry.as_ref(),
+                None,
+            )
+        } else {
+            rv
+        }
     }
 }
 
@@ -91,6 +135,7 @@ where
     for<'a> &'a mut C: IntoIterator<Item = &'a mut Peekable<S>>,
     for<'a> &'a C: IntoIterator<Item = &'a Peekable<S>>,
     S: OrderedStream + Unpin,
+    S::Ordering: Clone,
 {
     fn is_terminated(&self) -> bool {
         self.0.into_iter().all(|peekable| peekable.is_terminated())
@@ -123,15 +168,22 @@ impl<C, S> OrderedStream for JoinMultiplePin<C>
 where
     for<'a> Pin<&'a mut C>: IntoIterator<Item = Pin<&'a mut Peekable<S>>>,
     S: OrderedStream,
+    S::Ordering: Clone,
 {
     type Ordering = S::Ordering;
     type Data = S::Data;
     fn poll_next_before(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         before: Option<&S::Ordering>,
     ) -> Poll<PollResult<S::Ordering, S::Data>> {
-        poll_multiple(self.as_pin_mut(), cx, before)
+        let mut retry = None;
+        let rv = poll_multiple_step(self.as_mut().as_pin_mut(), cx, before, Some(&mut retry));
+        if rv.is_pending() && retry.is_some() {
+            poll_multiple_step(self.as_pin_mut(), cx, retry.as_ref(), None)
+        } else {
+            rv
+        }
     }
 }
 

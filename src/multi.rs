@@ -41,8 +41,8 @@ where
         }
     }
     match best {
+        _ if has_pending => Poll::Pending,
         None if has_data => Poll::Ready(PollResult::NoneBefore),
-        None if has_pending => Poll::Pending,
         None => Poll::Ready(PollResult::Terminated),
         // This is guaranteed to return PollResult::Item
         Some(mut stream) => stream.as_mut().poll_next_before(cx, before),
@@ -139,22 +139,20 @@ where
 mod test {
     extern crate alloc;
 
-    use crate::FromStream;
-    use crate::JoinMultiple;
-    use crate::OrderedStreamExt;
-    use alloc::boxed::Box;
-    use alloc::vec::Vec;
-    use core::pin::Pin;
+    use crate::{FromStream, JoinMultiple, OrderedStream, OrderedStreamExt, PollResult};
+    use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+    use core::{cell::Cell, pin::Pin, task::Context, task::Poll};
     use futures_core::Stream;
-    use futures_util::stream::iter;
+    use futures_util::{pin_mut, stream::iter};
+
+    #[derive(Debug, PartialEq)]
+    pub struct Message {
+        serial: u32,
+    }
 
     #[test]
     fn join_mutiple() {
         futures_executor::block_on(async {
-            pub struct Message {
-                serial: u32,
-            }
-
             pub struct RemoteLogSource {
                 stream: Pin<Box<dyn Stream<Item = Message>>>,
             }
@@ -184,6 +182,109 @@ mod test {
                 let msg = joined.next().await.unwrap();
                 assert_eq!(msg.serial, i as u32 + 1);
             }
+        });
+    }
+
+    #[test]
+    fn join_one_slow() {
+        futures_executor::block_on(async {
+            pub struct DelayStream(Rc<Cell<u8>>);
+
+            impl OrderedStream for DelayStream {
+                type Ordering = u32;
+                type Data = Message;
+                fn poll_next_before(
+                    self: Pin<&mut Self>,
+                    _: &mut Context<'_>,
+                    before: Option<&Self::Ordering>,
+                ) -> Poll<PollResult<Self::Ordering, Self::Data>> {
+                    match self.0.get() {
+                        0 => Poll::Pending,
+                        1 if matches!(before, Some(&1)) => Poll::Ready(PollResult::NoneBefore),
+                        1 => Poll::Pending,
+
+                        2 => {
+                            self.0.set(3);
+                            Poll::Ready(PollResult::Item {
+                                data: Message { serial: 4 },
+                                ordering: 4,
+                            })
+                        }
+                        _ => Poll::Ready(PollResult::Terminated),
+                    }
+                }
+            }
+
+            let stream1 = iter([
+                Message { serial: 1 },
+                Message { serial: 3 },
+                Message { serial: 5 },
+            ]);
+
+            let stream1 = FromStream::with_ordering(stream1, |m| m.serial);
+            let go = Rc::new(Cell::new(0));
+            let stream2 = DelayStream(go.clone());
+
+            let stream1: Pin<Box<dyn OrderedStream<Ordering = u32, Data = Message>>> =
+                Box::pin(stream1);
+            let stream2: Pin<Box<dyn OrderedStream<Ordering = u32, Data = Message>>> =
+                Box::pin(stream2);
+            let streams = vec![stream1.peekable(), stream2.peekable()];
+            let join = JoinMultiple(streams);
+            let waker = futures_util::task::noop_waker();
+            let mut ctx = core::task::Context::from_waker(&waker);
+
+            pin_mut!(join);
+
+            // When the DelayStream has no information about what it contains, join returns Pending
+            // (since there could be a serial-0 message output of DelayStream)
+            assert_eq!(
+                join.as_mut().poll_next_before(&mut ctx, None),
+                Poll::Pending
+            );
+
+            go.set(1);
+            // Now the DelayStream will return NoneBefore on serial 1
+            assert_eq!(
+                join.as_mut().poll_next_before(&mut ctx, None),
+                Poll::Ready(PollResult::Item {
+                    data: Message { serial: 1 },
+                    ordering: 1,
+                })
+            );
+            // however, it does not (yet) do so for serial 3
+            assert_eq!(
+                join.as_mut().poll_next_before(&mut ctx, None),
+                Poll::Pending
+            );
+
+            go.set(2);
+            assert_eq!(
+                join.as_mut().poll_next_before(&mut ctx, None),
+                Poll::Ready(PollResult::Item {
+                    data: Message { serial: 3 },
+                    ordering: 3,
+                })
+            );
+            assert_eq!(
+                join.as_mut().poll_next_before(&mut ctx, None),
+                Poll::Ready(PollResult::Item {
+                    data: Message { serial: 4 },
+                    ordering: 4,
+                })
+            );
+            assert_eq!(
+                join.as_mut().poll_next_before(&mut ctx, None),
+                Poll::Ready(PollResult::Item {
+                    data: Message { serial: 5 },
+                    ordering: 5,
+                })
+            );
+
+            assert_eq!(
+                join.as_mut().poll_next_before(&mut ctx, None),
+                Poll::Ready(PollResult::Terminated)
+            );
         });
     }
 }

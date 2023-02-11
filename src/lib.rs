@@ -131,10 +131,56 @@ where
     }
 }
 
+impl<S> OrderedStream for Option<S>
+where
+    S: OrderedStream,
+{
+    type Data = S::Data;
+    type Ordering = S::Ordering;
+
+    fn poll_next_before(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        before: Option<&Self::Ordering>,
+    ) -> Poll<PollResult<Self::Ordering, Self::Data>> {
+        match self.as_pin_mut() {
+            Some(s) => s.poll_next_before(cx, before),
+            None => Poll::Ready(PollResult::Terminated),
+        }
+    }
+
+    fn position_hint(&self) -> Option<MaybeBorrowed<'_, Self::Ordering>> {
+        self.as_ref().and_then(|s| s.position_hint())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.as_ref().map_or((0, Some(0)), |s| s.size_hint())
+    }
+}
+
 /// An [`OrderedStream`] that tracks if the underlying stream should be polled.
 pub trait FusedOrderedStream: OrderedStream {
     /// Returns `true` if the stream should no longer be polled.
     fn is_terminated(&self) -> bool;
+}
+
+impl<P> FusedOrderedStream for Pin<P>
+where
+    P: core::ops::DerefMut + Unpin,
+    P::Target: FusedOrderedStream,
+{
+    fn is_terminated(&self) -> bool {
+        (**self).is_terminated()
+    }
+}
+
+impl<S> FusedOrderedStream for Option<S>
+where
+    S: FusedOrderedStream,
+{
+    fn is_terminated(&self) -> bool {
+        self.as_ref().map_or(true, |s| s.is_terminated())
+    }
 }
 
 /// The result of a [`OrderedStream::poll_next_before`] operation.
